@@ -1,4 +1,4 @@
-# CSIformer
+# SEP Framework
 
 This is an official implementation for the paper: **SEP: A General Lossless Compression Framework with Semantics Enhancement and Multi-Stream Pipelines**.
 SEP is a deep-learning-based lossless compression framework, designed to improve both the compression speed and compression ratio. SEP framework stands out by transforming existing single-byte symbols into sub-sequence level patches, enabling a more efficient capture of compressed sequence correlations. At the same time, SEP uses GPU memory optimization and pipelines.
