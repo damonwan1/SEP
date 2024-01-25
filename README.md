@@ -50,6 +50,8 @@ We use Compression Speed and Compression Ratio as model evaluation metrics. Over
 <img src="./images/3.png" alt="" align=center />
 </p>
 
+## Pre-training Models
+Available at: https://drive.google.com/file/d/18ltzjRFGDQrpu9Kz2zz28xQ9Obcnazpu/view?usp=sharing
 
 
 ## Model Comparision
