@@ -1,0 +1,52 @@
+FLAGS.seq_len change from 1 to 16 due to FLAGS.vocab_dim = 16 and FLAGS.hidden_dim = 256.
+mlpCompressor(
+  (input_map): Embedding(256, 16)
+  (output_logit_map): Linear(in_features=256, out_features=256, bias=True)
+  (layers): ModuleList(
+    (0): BELayer(
+      (V_map): dense_baens()
+      (layernorm1): LayerNorm((16,), eps=1e-05, elementwise_affine=True)
+      (layernorm2): LayerNorm((16,), eps=1e-05, elementwise_affine=True)
+    )
+    (1): LinearLayer(
+      (U_map): Linear(in_features=256, out_features=4096, bias=True)
+      (V_map): Linear(in_features=4096, out_features=256, bias=True)
+      (layernorm1): LayerNorm((256,), eps=1e-05, elementwise_affine=True)
+      (layernorm2): LayerNorm((256,), eps=1e-05, elementwise_affine=True)
+    )
+    (2): BELayer(
+      (V_map): dense_baens()
+      (layernorm1): LayerNorm((32,), eps=1e-05, elementwise_affine=False)
+      (layernorm2): LayerNorm((32,), eps=1e-05, elementwise_affine=True)
+    )
+    (3): LinearLayer(
+      (U_map): Linear(in_features=256, out_features=4096, bias=True)
+      (V_map): Linear(in_features=4096, out_features=256, bias=True)
+      (layernorm1): LayerNorm((256,), eps=1e-05, elementwise_affine=True)
+      (layernorm2): LayerNorm((256,), eps=1e-05, elementwise_affine=True)
+    )
+    (4): BELayer(
+      (V_map): dense_baens()
+      (layernorm1): LayerNorm((64,), eps=1e-05, elementwise_affine=False)
+      (layernorm2): LayerNorm((64,), eps=1e-05, elementwise_affine=True)
+    )
+    (5): LinearLayer(
+      (U_map): Linear(in_features=256, out_features=4096, bias=True)
+      (V_map): Linear(in_features=4096, out_features=256, bias=True)
+      (layernorm1): LayerNorm((256,), eps=1e-05, elementwise_affine=True)
+      (layernorm2): LayerNorm((256,), eps=1e-05, elementwise_affine=True)
+    )
+    (6): BELayer(
+      (V_map): dense_baens()
+      (layernorm1): LayerNorm((128,), eps=1e-05, elementwise_affine=False)
+      (layernorm2): LayerNorm((128,), eps=1e-05, elementwise_affine=True)
+    )
+    (7): LinearLayer(
+      (U_map): Linear(in_features=256, out_features=4096, bias=True)
+      (V_map): Linear(in_features=4096, out_features=256, bias=True)
+      (layernorm1): LayerNorm((256,), eps=1e-05, elementwise_affine=True)
+      (layernorm2): LayerNorm((256,), eps=1e-05, elementwise_affine=True)
+    )
+  )
+)
+1953108

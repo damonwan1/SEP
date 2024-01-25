@@ -1,0 +1,10 @@
+Traceback (most recent call last):
+  File "scompressorTwo.py", line 250, in <module>
+    app.run(main)
+  File "/public/home/liufang395/anaconda3/envs/torch113_py38/lib/python3.8/site-packages/absl/app.py", line 308, in run
+    _run_main(main, args)
+  File "/public/home/liufang395/anaconda3/envs/torch113_py38/lib/python3.8/site-packages/absl/app.py", line 254, in _run_main
+    sys.exit(main(argv))
+  File "scompressorTwo.py", line 207, in main
+    with open(FLAGS.input_dir, 'rb') as fp:#, encoding='latin-1') as fp:
+FileNotFoundError: [Errno 2] No such file or directory: '../../../data/silesia'
