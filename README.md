@@ -58,6 +58,8 @@ Available at: https://drive.google.com/file/d/18ltzjRFGDQrpu9Kz2zz28xQ9Obcnazpu/
 
 To improve both compression ratio and compression speed of deep-learning-based lossless compressors, the existing research focus on different networks. The recent deep-learning-based lossless compressors are mainly built based on PyTorch. In Table, we present the various characteristics of several deep-learning-based compressors. Compressors like tensorflow-compress and DecMac use Long Short-Term Memory(LSTM) to capture long-term dependencies within the input data stream.  Through the studies on different networks, the latest research suggests that the mechanisms of transformer and multi-layer perception (MLP) can achieve even more accurate estimation and also higher compression speed compared to other deep-learning-based lossless compressors. NNCP, TRACE, OREO and PAC are the typical compressors which use transformer or MLP. The most deep-learning-based lossless compressors train their networks with GPU to speed up the compression process. PAC reduces the traffic of CPU-GPU data transfer using software cache in GPU memory, which helps PAC compressing faster. The work on GPU memory optimization is mainly focused on offloading, recomputation and defragmentation, with no attention paid to multi-stream reusage.
 
+We put all the original experiment logs and results in the "/XXXmodel/results" directory.
+
 <p align="center">
 <img src="./images/4.png" alt="" align=center />
 </p>
