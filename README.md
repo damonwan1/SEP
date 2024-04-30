@@ -63,7 +63,7 @@ To improve both compression ratio and compression speed of deep-learning-based l
 </p>
 
 ## Appendix
-[View the Appendix]([https://example.com/path/to/your/file.pdf](https://github.com/damonwan1/SEP/blob/main/APPENDIX_sep.pdf))
+View the Appendix:[https://example.com/path/to/your/file.pdf](https://github.com/damonwan1/SEP/blob/main/APPENDIX_sep.pdf)
 
 ## Acknowledgement
 
