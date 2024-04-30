@@ -42,9 +42,9 @@ nohup ./run.sh &
 tail -f nohup.log
 ```
 
-## Main Results
+## Model Comparision
 
-We use Compression Speed and Compression Ratio as model evaluation metrics. Overall, CSIformer model achieves the best performance in the vast majority of cases.
+We use Compression Speed and Compression Ratio as model evaluation metrics. Overall, SEP model achieves the best performance in the vast majority of cases.
 
 <p align="center">
 <img src="./images/3.png" alt="" align=center />
@@ -54,7 +54,7 @@ We use Compression Speed and Compression Ratio as model evaluation metrics. Over
 Available at: https://drive.google.com/file/d/18ltzjRFGDQrpu9Kz2zz28xQ9Obcnazpu/view?usp=sharing
 
 
-## Model Comparision
+## Main Results
 
 To improve both compression ratio and compression speed of deep-learning-based lossless compressors, the existing research focus on different networks. The recent deep-learning-based lossless compressors are mainly built based on PyTorch. In Table, we present the various characteristics of several deep-learning-based compressors. Compressors like tensorflow-compress and DecMac use Long Short-Term Memory(LSTM) to capture long-term dependencies within the input data stream.  Through the studies on different networks, the latest research suggests that the mechanisms of transformer and multi-layer perception (MLP) can achieve even more accurate estimation and also higher compression speed compared to other deep-learning-based lossless compressors. NNCP, TRACE, OREO and PAC are the typical compressors which use transformer or MLP. The most deep-learning-based lossless compressors train their networks with GPU to speed up the compression process. PAC reduces the traffic of CPU-GPU data transfer using software cache in GPU memory, which helps PAC compressing faster. The work on GPU memory optimization is mainly focused on offloading, recomputation and defragmentation, with no attention paid to multi-stream reusage.
 
@@ -62,6 +62,8 @@ To improve both compression ratio and compression speed of deep-learning-based l
 <img src="./images/4.png" alt="" align=center />
 </p>
 
+## Appendix
+[View the Appendix]([https://example.com/path/to/your/file.pdf](https://github.com/damonwan1/SEP/blob/main/APPENDIX_sep.pdf))
 
 ## Acknowledgement
 
