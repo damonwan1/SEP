@@ -28,19 +28,55 @@ The SEP framework with the workflow detail of the Semantics Enhancement Block (S
 
 ## Usage
 
-1. Install Pytorch and necessary dependencies.
+Run the commands below from the repository root. Install NumPy and PyTorch in
+your Python environment. For the GPU commands, use a CUDA-enabled PyTorch
+build. Replace `input.bin` with the path to any file you want to compress.
 
-```
-pip install -r requirements.txt
+`--input_dir` takes a **file path**. For compression, pass the original file.
+For decompression, pass the `.compressed.combined` archive. `--output` sets
+the destination path for either operation.
+
+### SEP+TRACE
+
+```sh
+python "4SEP+TRACE/stream-trace3cls.py" --mode=compress --device=cuda --input_dir input.bin --output trace.compressed.combined
+python "4SEP+TRACE/stream-trace3cls.py" --mode=decompress --device=cuda --input_dir trace.compressed.combined --output trace.restored.bin
 ```
 
-2. Download data. You can download all the datasets. Create a seperate folder ./data and put all the files in the directory.
+### SEP+PAC
 
-3. Train and evaluate the model. All the scripts are in the directory ./SEP/Model/run.sh. For example, if you want to get the TRACE results for Enwik9 dataset, just run the following command, and you can open nohup.log to see the results once the training is done.
+```sh
+python "2SEP+PAC/pac-patch-stride-stream-1.py" --mode=compress --device=cuda --input_dir input.bin --output pac.compressed.combined
+python "2SEP+PAC/pac-patch-stride-stream-1.py" --mode=decompress --device=cuda --input_dir pac.compressed.combined --output pac.restored.bin
 ```
-nohup ./run.sh &
-tail -f nohup.log
+
+### SEP+PatchTST
+
+```sh
+python "6SEP+PatchTST/tst-patch-stride-stream.py" --mode=compress --device=cuda --input_dir input.bin --output patchtst.compressed.combined
+python "6SEP+PatchTST/tst-patch-stride-stream.py" --mode=decompress --device=cuda --input_dir patchtst.compressed.combined --output patchtst.restored.bin
 ```
+
+For a CPU round trip, replace `--device=cuda` with `--device=cpu` in both
+commands. Use the same model entry point and compute backend for compression
+and decompression. The decoder replays online training, so use the same
+PyTorch environment for both operations whenever possible.
+
+### Version 1 archive format
+
+All three codecs write a binary `.compressed.combined` archive. The archive
+starts with the codec identifier (`SEPTRACE`, `SEPPAC`, or `SEPPATCHTST`)
+and a one-byte format version (`0x01`). A 4-byte big-endian length precedes
+the JSON header, which records the original byte count, the model settings,
+the compute backend, the CPU thread count when applicable, and the original
+file's SHA-256 hash.
+
+The header is followed by the arithmetic-coded streams, including a tail
+stream when needed. Each stream has an 8-byte big-endian length prefix.
+The decoder reads the model settings from the header and verifies the
+restored bytes against the stored SHA-256 hash before replacing the output
+file. Legacy `.compressed.combined` files lack this versioned header and are
+incompatible with these decoders.
 
 ## Model Comparision
 
