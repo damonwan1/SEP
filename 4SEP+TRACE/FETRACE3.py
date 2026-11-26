@@ -13,15 +13,14 @@ def valid_feature_type(feature_type):
         '_')[1].isdigit()
     return bool1 or bool2
 class MaskModel(nn.Module):
-    def __init__(self, input_shape=(512, 61, 256), threshold=0.5, patch=4, device=torch.device('cuda:0')):
+    def __init__(self, input_shape=(512, 61, 256), threshold=0.5, patch=4, device=None):
         super().__init__()
-        self.mask = nn.Parameter(torch.empty((512, input_shape[1], 256), device=device))
+        self.mask = nn.Parameter(torch.empty(input_shape, device=device))
         torch.nn.init.xavier_normal_(self.mask)
-        #self.mask = nn.Parameter(torch.ones((1, input_shape[1], 1), device=device))
-        self.init_mask = torch.ones((1, input_shape[1], 1), device=device)
-        self.indices_to_keep = (torch.arange(input_shape[1], device=device) % patch == 0).unsqueeze(-1).float()
-        self.threshold = torch.tensor(threshold, device=device)
-        self.last_z_dim = None  # 用于保存z的第二维度的大小
+        indices = (torch.arange(input_shape[1], device=device) % patch == 0).unsqueeze(-1).float()
+        self.register_buffer("indices_to_keep", indices)
+        self.register_buffer("threshold", torch.tensor(threshold, device=device))
+
     def forward(self, x):
 
         mask = torch.sigmoid(self.mask).to(x.device)
@@ -35,7 +34,8 @@ class MaskModel(nn.Module):
 
 class SLiMPerformer(torch.nn.Module):
 
-    def __init__(self, vocab_size, vocab_dim, hidden_dim, n_layers, ffn_dim, n_heads, feature_type, compute_type):
+    def __init__(self, vocab_size, vocab_dim, hidden_dim, n_layers, ffn_dim, n_heads, feature_type, compute_type,
+                 batch_size=512, seq_len=64, device=None):
         super(SLiMPerformer, self).__init__()
 
         self._vocab_size = vocab_size
@@ -50,14 +50,15 @@ class SLiMPerformer(torch.nn.Module):
                                compute_type) for _ in range(n_layers)
         ])
 
-        self.mask = MaskModel()
-        self.U_map = torch.nn.Linear(61, 4, bias=True)
+        patch_count = seq_len - 4 + 1
+        self.mask = MaskModel((batch_size, patch_count, 4 * self._vocab_dim), device=device)
+        self.U_map = torch.nn.Linear(patch_count, 4, bias=True)
         torch.nn.init.kaiming_normal_(self.U_map.weight, nonlinearity='relu')
         torch.nn.init.constant_(self.U_map.bias, 0)
         self.X_map = torch.nn.Linear(4, 128, bias=True)
         self.Z_map = torch.nn.Linear(128,1, bias=True)
         
-    def forward(self, x,inputs_list=None,streamPooling=None):
+    def forward(self, x):
 
 
         x = self.input_map(x)
@@ -98,36 +99,13 @@ class SLiMPerformer(torch.nn.Module):
     
         return x
 
-    def full_loss(self,
-                  inputs,inputs_list=None,streamPooling=None,
-                  with_grad=True):
-
-        logits = self.forward(inputs[:, :-1],inputs_list,streamPooling)
-        logits = logits.transpose(1, 2)
-        loss = torch.nn.functional.cross_entropy(
-            logits[:, :, -1], inputs[:, -1], reduction='mean')
-
+    def full_loss(self, inputs, with_grad=True):
+        logits = self.forward(inputs[:, :-1]).transpose(1, 2)
+        loss = torch.nn.functional.cross_entropy(logits[:, :, -1], inputs[:, -1])
         if with_grad:
-            if inputs_list is not None:
-                for i in range(1,4):
-                    with torch.cuda.stream(streamPooling[i]):
-                        inputs_list[i] = inputs_list[i].to("cuda",non_blocking=True).long()
             loss.backward()
-
         return loss, logits
-    # def full_loss(self, inputs, with_grad=True, lambda_mask=0.001):
-    #     logits = self.forward(inputs[:, :-1])
-    #     logits = logits.transpose(1, 2)
-    #     cross_entropy_loss = torch.nn.functional.cross_entropy(logits[:, :, -1], inputs[:, -1], reduction='mean')
-    
-    #     mask_loss = torch.norm(self.mask.mask, p=2)  # Compute L1 norm of the mask
 
-    #     total_loss = cross_entropy_loss + lambda_mask * mask_loss  # Add regularization term
-
-    #     if with_grad:
-    #         total_loss.backward()
-    
-    #     return total_loss, logits
     def _concat_pos_embs(self, x, start_index):
 
         pos_emb_size = self._vocab_dim // 2

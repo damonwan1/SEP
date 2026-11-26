@@ -1,489 +1,394 @@
-import collections
-import gzip
+import argparse
+from contextlib import ExitStack
+import hashlib
+import json
+import multiprocessing
 import os
-import time
-import utils
-import struct
+from pathlib import Path
+from queue import Full
 import shutil
-from absl import app
-from absl import flags
-from absl import logging
+import struct
+import tempfile
+import time
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-import torch.cuda as cuda
-#import compress_model
-import arithmeticcoding_fast
-import utils
-from torch.profiler import profile, record_function, ProfilerActivity
-import threading
-from concurrent.futures import ThreadPoolExecutor
-import multiprocessing
-import copy
-import FETRACE3
-## 原始方法，未加同步操作
 
-# max_workers表示工人数量,也就是jincheng池里面的数量
-#processPooling = multiprocessing.Pool(processes=4)
-# 任务列表
-
-def write_to_file(content):
-  with open("test.txt", "w") as file:
-    file.write(content)
-gpudevice = torch.device("cuda")
+import arithmeticcoding_fast as arithmetic
+from FETRACE3 import SLiMPerformer
 
 
-    
-torch.manual_seed(0)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-torch.set_printoptions(profile="full") 
-FLAGS = flags.FLAGS
-
-# Model parameters
-flags.DEFINE_integer('batch_size', 512, 'Batch size for training.')
-flags.DEFINE_float('learning_rate', 1e-3, 'Adam Optimizer learning rate.')
-flags.DEFINE_integer('hidden_dim', 256, 'Feature dimension.')
-flags.DEFINE_integer('vocab_dim', 64, 'Feature dimension.')
-flags.DEFINE_integer('n_layers', 1, 'Number of Attention layers.')
-flags.DEFINE_integer('ffn_dim', 4096, 'MLP dimension in model.')
-flags.DEFINE_integer('n_heads',8, 'Number of heads for attention.')
-flags.DEFINE_string(
-    'feature_type', 'sqr',
-    'Nonlinearity function for feature. Can be relu, elu+1, sqr, favor+, or favor+{int}.'
-)
-flags.DEFINE_enum(
-    'compute_type', 'iter', ['iter', 'ps', 'parallel_ps'],
-    'Which type of method to compute: iter = iterative algorithm, ps = implementation using torch.cumsum, parallel_ps = implementation using custom log prefix sum implementation.'
-)
-flags.DEFINE_float('weight_decay', 0.0, 'Weight decay for regularization.')
-
-# Training parameters
-flags.DEFINE_string('gpu_id', '0', 'ID of GPU.')
-flags.DEFINE_integer('random_seed', 0, 'Random seed for both Numpy and Torch.')
-flags.DEFINE_integer('print_step', 1000, 'Interval to print metrics.')
-# Dataset parameters
-flags.DEFINE_integer('seq_len', 64, 'Maximum sequence length (L).')
-flags.DEFINE_integer('vocab_size', 256, 'Vocabulary size of data.')
-flags.DEFINE_string('input_dir', '../data/book1', 'input data dir')
-flags.DEFINE_string('prefix', '_book1', 'output dir')
+MAGIC = b"SEPTRACE\x01"
+MODEL_DEFAULTS = {
+    "batch_size": 512, "seq_len": 64, "vocab_size": 256, "vocab_dim": 64,
+    "hidden_dim": 256, "n_layers": 1, "ffn_dim": 4096, "n_heads": 8,
+    "feature_type": "sqr", "compute_type": "iter", "learning_rate": 1e-3,
+    "weight_decay": 0.0, "random_seed": 0,
+}
+UNIFORM_CDF = np.empty(257, dtype=np.uint64)
+UNIFORM_CDF[0] = 0
+UNIFORM_CDF[1:] = np.cumsum(np.full(256, 10_000_000 / 256 + 1))
+MAX_HEADER = 65536
 
 
-def coder_write(queue,temp_dir,compressed_file,bs1,cumul1,series1,ind1):
-  print(f"start to right")
-  # Define enc ****************************
-  f = [open(temp_dir+"/"+compressed_file+'.'+str(i),'wb') for i in range(bs1)]
-  bitout = [arithmeticcoding_fast.BitOutputStream(f[i]) for i in range(bs1)]
-  enc = [arithmeticcoding_fast.ArithmeticEncoder(32, bitout[i]) for i in range(bs1)]
-  # ********************************
-  # Init. enc
-  for i in range(bs1):
-    for j in range(FLAGS.seq_len):
-      enc[i].write(cumul1, series1[ind1[i]+j])
-  # ****************************************
-  # start write for each train
-  coder_num = 1
-  while True:
-    if not queue.empty():
-      #print("子进程：队列中结果个数：")
-      #print(queue.qsize())
-      data = queue.get()
-      if data is None:
-        break
-      bs,cumul_batch,y=data
-      #print("取回队列的次数:"+ str(coder_num))
-      coder_num = coder_num +1
-      #print("Child:"+str(coder_num))
-      #print(cumul_batch)
-      for i in range(bs):
-        enc[i].write(cumul_batch[i,:], y[i])
-    else:
-      time.sleep(1)
-  # *******************************************
-  for i in range(bs1):
-    enc[i].finish()
-    bitout[i].close()
-    f[i].close()
-  print("write end!")
+def split_input(size, batch_size, history):
+    # Preserve the benchmark's shard boundaries. All remaining bytes belong to
+    # the tail, even when the number of sliding windows divides evenly.
+    shard_size = (size - history) // batch_size
+    if shard_size <= history:
+        return 0, size
+    return shard_size, size - batch_size * shard_size
 
 
-def decode(temp_dir, compressed_file, FLAGS, len_series, last):
-  
-  bs = FLAGS.batch_size
+def frequencies(probabilities):
+    result = np.zeros((probabilities.shape[0], 257), dtype=np.uint64)
+    result[:, 1:] = np.cumsum(probabilities * 10_000_000 + 1, axis=1)
+    return result
 
-  iter_num = (len_series - FLAGS.seq_len) // FLAGS.batch_size
-  
-  ind = np.array(range(bs))*iter_num
-  print(iter_num - FLAGS.seq_len)
-  series_2d = np.zeros((bs,iter_num), dtype = np.uint8).astype('int')
 
-  f = [open(temp_dir+"/"+compressed_file+'.'+str(i),'rb') for i in range(bs)]
-  bitin = [arithmeticcoding_fast.BitInputStream(f[i]) for i in range(bs)]
-  dec = [arithmeticcoding_fast.ArithmeticDecoder(32, bitin[i]) for i in range(bs)]
+def init_model(config, device):
+    if device.type == "cuda":
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    # Older PyTorch CUDA builds report cumsum as unsupported in strict mode.
+    # Enable deterministic kernels where available and verify decoded bytes.
+    torch.use_deterministic_algorithms(True, warn_only=device.type == "cuda")
+    torch.manual_seed(config["random_seed"])
+    model = SLiMPerformer(
+        config["vocab_size"], config["vocab_dim"], config["hidden_dim"],
+        config["n_layers"], config["ffn_dim"], config["n_heads"],
+        config["feature_type"], config["compute_type"],
+        batch_size=config["batch_size"], seq_len=config["seq_len"], device=device,
+    ).to(device)
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=config["learning_rate"], weight_decay=config["weight_decay"],
+    )
+    return model, optimizer
 
-  prob = np.ones(FLAGS.vocab_size)/FLAGS.vocab_size
-  cumul = np.zeros(FLAGS.vocab_size+1, dtype = np.uint64)
-  cumul[1:] = np.cumsum(prob*10000000 + 1)
 
-  # Decode first K symbols in each stream with uniform probabilities
-  for i in range(bs):
-    for j in range(min(FLAGS.seq_len, iter_num)):
-      series_2d[i,j] = dec[i].read(cumul, FLAGS.vocab_size)
-  
-  cumul_batch = np.zeros((bs, FLAGS.vocab_size+1), dtype = np.uint64)
-
-  os.environ['CUDA_VISIBLE_DEVICES'] = FLAGS.gpu_id
-  np.random.seed(FLAGS.random_seed)
-  torch.manual_seed(FLAGS.random_seed)
-
-  model = compress_model.SLiMPerformer(FLAGS.vocab_size, FLAGS.vocab_dim, FLAGS.hidden_dim,FLAGS.n_layers, FLAGS.ffn_dim,FLAGS.n_heads, FLAGS.feature_type, FLAGS.compute_type).cuda()
-  print(model)
-
-  optimizer = torch.optim.Adam(model.parameters(), lr=FLAGS.learning_rate, weight_decay=FLAGS.weight_decay, betas=(.9, .999))
-
-  training_start = time.time()
-  for train_index in range(iter_num-FLAGS.seq_len):
-    model.train()
-    train_batch = torch.LongTensor(series_2d[:, train_index:train_index + FLAGS.seq_len]).cuda()
-    logits = model.forward(train_batch)
-    prob = logits[:, -1, :]
-    prob = F.softmax(prob, dim=1).detach().cpu().numpy()
-    
-    cumul_batch[:,1:] = np.cumsum(prob*10000000 + 1, axis = 1)
-
-    # Decode with Arithmetic Encoder
-    for i in range(bs):
-      series_2d[i,train_index+FLAGS.seq_len] = dec[i].read(cumul_batch[i,:], FLAGS.vocab_size)
-    
-    logits = logits.transpose(1, 2)
-    label = torch.from_numpy(series_2d[:, train_index+1:train_index+FLAGS.seq_len+1]).cuda()
-    train_loss = torch.nn.functional.cross_entropy(logits[:, :, -1], label[:, -1], reduction='mean')
-    train_loss.backward()
+def update_model(logits, labels, optimizer):
+    F.cross_entropy(logits, labels).backward()
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
-    
-    if train_index % FLAGS.print_step == 0:
-      print(train_index, ":", train_loss.item()/np.log(2))
-  
-    
-  out = open('tttdecompressed_out', 'w')
-  for i in range(len(series_2d)):
-    out.write(utils.decode_tokens(series_2d[i]))
-  
-  
-  for i in range(bs):
-    bitin[i].close()
-    f[i].close()
 
-  if last:
-    series = np.zeros(last, dtype = np.uint8).astype('int')
-    f = open(temp_dir+"/"+compressed_file+'.last','rb')
-    bitin = arithmeticcoding_fast.BitInputStream(f)
-    dec = arithmeticcoding_fast.ArithmeticDecoder(32, bitin)
-    prob = np.ones(FLAGS.vocab_size)/FLAGS.vocab_size
-    cumul = np.zeros(FLAGS.vocab_size+1, dtype=np.uint64)
-    cumul[1:] = np.cumsum(prob*10000000 + 1)
 
-    for j in range(last):
-      series[j] = dec.read(cumul, FLAGS.vocab_size)
-  
-    print("Last decode part don't need inference.")
-    out.write(utils.decode_tokens(series))
-    print(utils.decode_tokens(series))
-    bitin.close()
-    f.close()
-    return
- 
+def make_encoder(file):
+    return arithmetic.ArithmeticEncoder(32, arithmetic.BitOutputStream(file))
 
-def encode(temp_dir, compressed_file, FLAGS, series, train_data, last_train_data,queue,enc):
-  
-  stream_num = 4
-  bs = FLAGS.batch_size
-  prob = np.ones(FLAGS.vocab_size)/FLAGS.vocab_size
-  cumul = np.zeros(FLAGS.vocab_size+1, dtype=np.uint64)
-  cumul[1:] = np.cumsum(prob*10000000 + 1)
-  
-  iter_num = len(train_data) // FLAGS.batch_size
-  ind = np.array(range(bs))*iter_num
-  iter_num -= FLAGS.seq_len
-  
-  write_process = multiprocessing.Process(target=coder_write, args=(queue,temp_dir,compressed_file,bs,cumul,series,ind))
-  write_process.start()
-  
-  cumul_batch = np.zeros((bs, FLAGS.vocab_size+1), dtype = np.uint64)
 
-  #model = PatchTST_backbone(FLAGS.seq_len,FLAGS.patch_len,FLAGS.stride,FLAGS.n_heads).cuda()
-  model = FETRACE3.SLiMPerformer(FLAGS.vocab_size, FLAGS.vocab_dim, FLAGS.hidden_dim,
-                                         FLAGS.n_layers, FLAGS.ffn_dim,
-                                         FLAGS.n_heads, FLAGS.feature_type, FLAGS.compute_type).cuda()
-  
-  optimizer = torch.optim.Adam(model.parameters(), lr=FLAGS.learning_rate, weight_decay=FLAGS.weight_decay, betas=(.9, .999))
-  print(iter_num)
-  # 定义三个时间的初始值
-  time_gpu_to_gpu = 0.0
-  time_training = 0.0
-  time_gpu_to_cpu = 0.0
-  time_write = 0.0
-  T1 = time.time()
-  
-   # Define Pooling
-  streamPooling=[]
-  prob=""
-  #eventPooling=[]
-  # 4 Init.
-  for i in range(0,stream_num):
-    stream = torch.cuda.Stream()
-    #event = torch.cuda.Event()
-    streamPooling.append(stream)
-    #eventPooling.append(event)
-  # step = 4
-  # 需要修改，能被4整除
-  record_num = 1
-  for train_index in range(0,iter_num,4):
-    # where is train data from????
-    model.train()
-    train_batch_list = []
-    y_list = []
-    # ????没变化？？？？
-    # 分批先取出 4 组训练数据
-    for i in range(0,stream_num):
-      train_batch = train_data[ind, :]
-      y = train_batch[:, -1]
-      y_list.append(y)
-      train_batch = torch.from_numpy(train_batch)
-      train_batch_list.append(train_batch)
-      ind += 1
-    # 4个stream执行4组训练数据
-    for i in range(0,stream_num):
-      with torch.cuda.stream(streamPooling[i]):
-        #print("stream:"+str(i)+"start!!!!!")
-        # *** H2D ***
-        # stream1的H2D现在执行，其他的都放到stream1训练的时候，并行执行，因CPU那时候会有很长的同步等待
-        if i == 0:
-          train_batch_list[i] = train_batch_list[i].to(gpudevice,non_blocking=True).long()
-        #train_batch_tmp = train_batch_list[i].to(gpudevice,non_blocking=True).long()
-        # Wait for last Train computing
-        # if i != 0 :
-        #   streamPooling[i].wait_event(eventPooling[i-1])
-        # GPU COMPUTING
-        train_loss, logits = model.full_loss(train_batch_list[i],train_batch_list,streamPooling, with_grad=True)
-        #GPU
-        optimizer.step()
-        #CPU
-        optimizer.zero_grad(set_to_none=True)
-        logits = logits.transpose(1, 2)
-        # 从预测结果中获取概率。
-        #CPU
-        prob = logits[:, -1, :]
-        # Notify the Next Stream to Execute GPU Computing
-        # if i == 3:
-        #   streamPooling[0].record()
-        # else:
-        #eventPooling[i].record()
-        
-        #softmax 在GPU，detach在GPU
-        probGPU = F.softmax(prob, dim=1).detach()
-        # GPU回到CPU的操作
-        prob = probGPU.to("cpu", non_blocking=True).numpy()
-        #print("stream:"+str(i)+"end!!!!!")
-        streamPooling[i].synchronize()
-        # 计算累积概率，并将结果保存在cumul_batch数组中。
-        cumul_batch[:,1:] = np.cumsum(prob*10000000 + 1, axis = 1)
-        #print("Main:"+str(train_index+i))
-        #print(cumul_batch)
-        # 将累积概率和目标标签写入enc对象中。
-        # 进程池 异步
-        queue.put((bs,copy.deepcopy(cumul_batch),y_list[i]))
-        #print("放入queue的次数:"+str(record_num))
-        record_num = record_num + 1
-        #print("主进程：队列中结果个数：")
-        #print(queue.qsize())
-        #processPooling.apply_async(coder_write, args=(bs,enc,cumul_batch,y,i))
-        #threadPooling.submit(coder_write, (bs,enc,cumul_batch,y))
-      # 每1000轮输出值
-    # 被4不能整除的后几轮，就用之前的方法吧
-    if train_index+stream_num >= iter_num:
-      for train_index in range(train_index+1,iter_num):
-        model.train()
-        train_batch = train_data[ind, :]
+def make_decoder(file):
+    return arithmetic.ArithmeticDecoder(32, arithmetic.BitInputStream(file))
 
-        y = train_batch[:, -1]
 
-        # GPU与GPU之间的操作
-        start = time.time()
-        train_batch = torch.from_numpy(train_batch).cuda().long()
-        end = time.time()
-        time_gpu_to_gpu += end - start
+def write_uniform(encoder, symbols):
+    for symbol in symbols:
+        encoder.write(UNIFORM_CDF, int(symbol))
 
-        # 训练过程
-        start = time.time()
-        train_loss, logits = model.full_loss(train_batch, with_grad=True)
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
-        end = time.time()
-        time_training += end - start
 
-        logits = logits.transpose(1, 2)
+def read_uniform(decoder, count):
+    return np.fromiter(
+        (decoder.read(UNIFORM_CDF, 256) for _ in range(count)), dtype=np.uint8, count=count,
+    )
 
-        # 从预测结果中获取概率。
-        prob = logits[:, -1, :]
 
-        # GPU回到CPU的操作
-        start = time.time()
-        prob = F.softmax(prob, dim=1).detach().cpu().numpy()
+def write_shards(queue, paths, prefixes):
+    with ExitStack() as stack:
+        encoders = [make_encoder(stack.enter_context(path.open("wb"))) for path in paths]
+        for encoder, prefix in zip(encoders, prefixes):
+            write_uniform(encoder, prefix)
+        while (batch := queue.get()) is not None:
+            cdfs, labels = batch
+            for encoder, cdf, label in zip(encoders, cdfs, labels):
+                encoder.write(cdf, int(label))
+        for encoder in encoders:
+            encoder.finish()
+            encoder.output.close()
 
-        start = time.time()
-        # 计算累积概率，并将结果保存在cumul_batch数组中。
-        cumul_batch[:,1:] = np.cumsum(prob*10000000 + 1, axis = 1)
-        #print("Main:"+str(train_index))
-        #print(cumul_batch)
-        # 将累积概率和目标标签写入enc对象中。
-        queue.put((bs,copy.deepcopy(cumul_batch),y))
-        ind += 1
-    if train_index % FLAGS.print_step == 0:
-      size = 0
-      for cf in os.listdir(temp_dir):
-        size += os.path.getsize(temp_dir+"/"+cf)
-      print(train_index, ":", train_loss.item()/np.log(2), "size:", size/(1024*1024))
-    # if train_index == 12:
-    #   break
-  # 防止后续提交
-  #processPooling.close()
-  # 等待所有任务完成
-  #processPooling.join()
-#   # 训练过程结束后，获取注意力权重，并将其转换为numpy数组
-#   attention_scores = model.backbone.encoder.layers[0].attn.cpu().detach().numpy()
-#   print(attention_scores.shape)
 
-#   # 使用numpy的save函数将注意力权重保存到.npy文件中
-    
-#   np.save('{}.npy'.format(FLAGS.prefix), attention_scores)
-  
-  print("waiting for write process!")
-  queue.put(None)
-  write_process.join()
-  print("end join!")
+def put_batch(queue, writer, batch):
+    while writer.is_alive():
+        try:
+            queue.put(batch, timeout=0.25)
+            return
+        except Full:
+            continue
+    raise RuntimeError(f"Arithmetic encoder process exited with code {writer.exitcode}")
 
-  if last_train_data is not None:
-    print("last series")
-    f = open(temp_dir+"/"+compressed_file+'.last','wb')
-    bitout = arithmeticcoding_fast.BitOutputStream(f)
-    enc = arithmeticcoding_fast.ArithmeticEncoder(32, bitout)
-    prob = np.ones(FLAGS.vocab_size)/FLAGS.vocab_size
-    cumul = np.zeros(FLAGS.vocab_size+1, dtype=np.uint64)
-    cumul[1:] = np.cumsum(prob*10000000 + 1)
-  
-    for j in range(len(last_train_data)):
-      enc.write(cumul, last_train_data[j])
-    print("Last encode part don't need inference.")
-  
-    enc.finish()
-    bitout.close()
-    f.close()
-  
-  return
-    
-def var_int_encode(byte_str_len, f):
-  while True:
-    this_byte = byte_str_len&127
-    byte_str_len >>= 7
-    if byte_str_len == 0:
-      f.write(struct.pack('B',this_byte))
-      break
-    f.write(struct.pack('B',this_byte|128))
-    byte_str_len -= 1
 
-def var_int_decode(f):
-    byte_str_len = 0
-    shift = 1
-    while True:
-        this_byte = struct.unpack('B', f.read(1))[0]
-        byte_str_len += (this_byte & 127) * shift
-        if this_byte & 128 == 0:
-                break
-        shift <<= 7
-        byte_str_len += shift
-    return byte_str_len
+def cpu_predictions(windows, model, optimizer, device):
+    for window in windows:
+        batch = torch.from_numpy(window.copy()).to(device=device, dtype=torch.long)
+        logits = model(batch[:, :-1].contiguous())[:, -1, :]
+        probabilities = F.softmax(logits.detach(), dim=1).numpy()
+        update_model(logits, batch[:, -1].contiguous(), optimizer)
+        yield probabilities, window[:, -1].copy()
 
-def main(_):
-  # prof = torch.profiler.profile(
-  #           on_trace_ready=torch.profiler.tensorboard_trace_handler('./'),
-  #           record_shapes=True,
-  #           with_stack=True)
 
-  #prof.start()
-  print("start!")
-  start_time = time.time()
-  queue = multiprocessing.Queue()
-  enc = ""
-  os.environ['CUDA_VISIBLE_DEVICES'] = FLAGS.gpu_id
-  np.random.seed(FLAGS.random_seed)
-  torch.manual_seed(FLAGS.random_seed)
+def cuda_predictions(windows, model, optimizer, device):
+    # Model updates share one stream so the decoder can replay them in order.
+    compute = torch.cuda.current_stream(device)
+    upload = torch.cuda.Stream(device=device)
+    download = torch.cuda.Stream(device=device)
+    pending = None
 
-  temp_dir = "{}_{}_{}_{}_bs{}_{}_seq{}_temp".format(FLAGS.prefix, FLAGS.vocab_dim, FLAGS.hidden_dim, FLAGS.ffn_dim, FLAGS.batch_size, FLAGS.n_layers, FLAGS.seq_len)
-  compressed_file = temp_dir.replace("_temp", ".compressed")
-  
-  if os.path.exists(temp_dir):
-    shutil.rmtree(temp_dir)
-  os.mkdir(temp_dir)
-  
-  def strided_app(a, L, S):  # Window len = L, Stride len/stepsize = S
-    nrows = ((a.size - L) // S) + 1
-    n = a.strides[0]
-    return np.lib.stride_tricks.as_strided(a, shape=(nrows, L), strides=(S * n, n))
-  
-  
-  with open(FLAGS.input_dir, 'rb') as fp:#, encoding='latin-1') as fp:
-    series = np.frombuffer(fp.read(), dtype=np.uint8)
-  train_data = strided_app(series, FLAGS.seq_len+1, 1)
+    def prefetch(window):
+        if window is None:
+            return None
+        host = torch.from_numpy(window.copy()).pin_memory()
+        with torch.cuda.stream(upload):
+            batch = host.to(device, non_blocking=True)
+            ready = upload.record_event()
+        return batch, ready, window[:, -1].copy()
 
-  total_length = len(train_data)
-  if total_length % FLAGS.batch_size == 0:
-    encode(temp_dir, compressed_file, FLAGS, series, train_data, None,queue,enc)
-  else:
-    l = total_length // FLAGS.batch_size * FLAGS.batch_size
-    encode(temp_dir, compressed_file, FLAGS, series[:l+FLAGS.seq_len], train_data[:l], series[l:],queue,enc)
-  #queue.put(None)
-  
-  #Combined compressed results
-  f = open(compressed_file+'.combined','wb')
-  for i in range(FLAGS.batch_size):
-    f_in = open(temp_dir+'/'+compressed_file+'.'+str(i),'rb')
-    byte_str = f_in.read()
-    byte_str_len = len(byte_str)
-    var_int_encode(byte_str_len, f)
-    f.write(byte_str)
-    f_in.close()
-  
-  if total_length % FLAGS.batch_size != 0:
-    f_in = open(temp_dir+'/'+compressed_file+'.last','rb')
-    byte_str = f_in.read()
-    byte_str_len = len(byte_str)
-    var_int_encode(byte_str_len, f)
-    f.write(byte_str)
-    f_in.close()
-  f.close()
-  
-  total = 0
-  for ff in os.listdir(temp_dir):
-    total += os.path.getsize(temp_dir+'/'+ff)
-  
-  print(total/(1024*1024))
-  
-  elapsed_time = time.time() - start_time
-  print("压缩完成，总共用时：{} 秒".format(elapsed_time))
-  print("@@@@@@@@@@@@@")
-  print("end！")
-  #prof.step()
-  #prof.stop()
-  #threadPooling.shutdown()
-  print("main执行完毕")
+    windows = iter(windows)
+    current = prefetch(next(windows, None))
+    while current is not None:
+        batch, uploaded, labels = current
+        compute.wait_event(uploaded)
+        batch.record_stream(compute)
+        batch = batch.long()
+        logits = model(batch[:, :-1].contiguous())[:, -1, :]
+        probabilities = F.softmax(logits.detach(), dim=1)
+        predicted = compute.record_event()
+        with torch.cuda.stream(download):
+            download.wait_event(predicted)
+            host_probabilities = probabilities.to("cpu", non_blocking=True)
+            probabilities.record_stream(download)
+            downloaded = download.record_event()
 
-if __name__ == '__main__':
+        current = prefetch(next(windows, None))
+        update_model(logits, batch[:, -1].contiguous(), optimizer)
 
-  app.run(main)
+        # Queue the next round's GPU work before waiting on the previous copy.
+        if pending is not None:
+            host, ready, previous_labels = pending
+            ready.synchronize()
+            yield host.numpy(), previous_labels
+        pending = host_probabilities, downloaded, labels
 
-  
-    
+    if pending is not None:
+        host, ready, labels = pending
+        ready.synchronize()
+        yield host.numpy(), labels
+    compute.synchronize()
+
+
+def encode_shards(shards, history, paths, config, device, print_step):
+    ctx = multiprocessing.get_context("spawn")
+    queue = ctx.Queue(maxsize=8)
+    writer = ctx.Process(target=write_shards, args=(queue, paths, shards[:, :history].copy()))
+    writer.start()
+    try:
+        model, optimizer = init_model(config, device)
+        windows = (shards[:, i:i + history + 1] for i in range(shards.shape[1] - history))
+        predict = cuda_predictions if device.type == "cuda" else cpu_predictions
+        for index, (probabilities, labels) in enumerate(predict(windows, model, optimizer, device)):
+            put_batch(queue, writer, (frequencies(probabilities), labels))
+            if print_step and (index + 1) % print_step == 0:
+                print(f"Encoded {index + 1} prediction batches", flush=True)
+        put_batch(queue, writer, None)
+        writer.join()
+        if writer.exitcode:
+            raise RuntimeError(f"Arithmetic encoder process exited with code {writer.exitcode}")
+    finally:
+        if writer.is_alive():
+            writer.terminate()
+            writer.join()
+        if writer.exitcode != 0:
+            queue.cancel_join_thread()
+        queue.close()
+        queue.join_thread()
+
+
+def read_exact(source, length):
+    data = source.read(length)
+    if len(data) != length:
+        raise ValueError("Truncated SEP+TRACE archive")
+    return data
+
+
+def pack_part(output, path):
+    with path.open("rb") as source:
+        output.write(struct.pack(">Q", path.stat().st_size))
+        shutil.copyfileobj(source, output)
+
+
+def unpack_part(source, path):
+    remaining, = struct.unpack(">Q", read_exact(source, 8))
+    if not remaining:
+        raise ValueError("Empty arithmetic coding stream")
+    with path.open("wb") as output:
+        while remaining:
+            block = read_exact(source, min(remaining, 1024 * 1024))
+            output.write(block)
+            remaining -= len(block)
+
+
+def compress(source, destination, config, device, print_step):
+    data = np.frombuffer(source.read_bytes(), dtype=np.uint8)
+    history = config["seq_len"]
+    batch_size = config["batch_size"]
+    shard_size, tail_size = split_input(len(data), batch_size, history)
+    split = shard_size * batch_size
+    header = json.dumps({
+        "size": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+        "model": config, "device": device.type,
+        "cpu_threads": torch.get_num_threads() if device.type == "cpu" else None,
+    }).encode("ascii")
+
+    with tempfile.TemporaryDirectory(dir=destination.parent) as temp:
+        temp = Path(temp)
+        paths = [temp / str(i) for i in range(batch_size)] if shard_size else []
+        if paths:
+            encode_shards(data[:split].reshape(batch_size, shard_size), history, paths, config, device, print_step)
+        if tail_size:
+            tail = temp / "tail"
+            with tail.open("wb") as part:
+                encoder = make_encoder(part)
+                write_uniform(encoder, data[split:])
+                encoder.finish()
+                encoder.output.close()
+            paths.append(tail)
+        archive = temp / "archive"
+        with archive.open("wb") as output:
+            output.write(MAGIC)
+            output.write(struct.pack(">I", len(header)))
+            output.write(header)
+            for path in paths:
+                pack_part(output, path)
+        os.replace(archive, destination)
+    return len(data)
+
+
+def decode_shards(paths, shards, config, device):
+    history = config["seq_len"]
+    model, optimizer = init_model(config, device)
+    with ExitStack() as stack:
+        decoders = [make_decoder(stack.enter_context(path.open("rb"))) for path in paths]
+        for decoder, row in zip(decoders, shards):
+            row[:history] = read_uniform(decoder, history)
+        for index in range(shards.shape[1] - history):
+            target = index + history
+            batch = torch.from_numpy(shards[:, index:target].copy()).to(device=device, dtype=torch.long)
+            logits = model(batch)[:, -1, :]
+            cdfs = frequencies(F.softmax(logits.detach(), dim=1).cpu().numpy())
+            labels = np.fromiter(
+                (decoder.read(cdf, 256) for decoder, cdf in zip(decoders, cdfs)),
+                dtype=np.uint8, count=len(decoders),
+            )
+            shards[:, target] = labels
+            update_model(logits, torch.from_numpy(labels).to(device=device, dtype=torch.long), optimizer)
+
+
+def decompress(source, destination, device):
+    with source.open("rb") as archive, tempfile.TemporaryDirectory(dir=destination.parent) as temp:
+        if archive.read(len(MAGIC)) != MAGIC:
+            raise ValueError("Unsupported archive format. This decoder requires a versioned SEP+TRACE archive.")
+        length, = struct.unpack(">I", read_exact(archive, 4))
+        if length > MAX_HEADER:
+            raise ValueError("Invalid SEP+TRACE header length")
+        header = json.loads(read_exact(archive, length))
+        config = header["model"]
+        validate_config(config)
+        if type(header["size"]) is not int or header["size"] < 0:
+            raise ValueError("Invalid original size")
+        size = header["size"]
+        batch_size = config["batch_size"]
+        shard_size, tail_size = split_input(size, batch_size, config["seq_len"])
+        if shard_size and header["device"] != device.type:
+            raise ValueError(f"Decode this archive with --device={header['device']} to replay the model")
+        if shard_size and device.type == "cpu":
+            torch.set_num_threads(header["cpu_threads"])
+
+        temp = Path(temp)
+        paths = [temp / str(i) for i in range(batch_size)] if shard_size else []
+        tail = temp / "tail"
+        for path in paths + ([tail] if tail_size else []):
+            unpack_part(archive, path)
+        if archive.read(1):
+            raise ValueError("Unexpected data after the last SEP+TRACE stream")
+
+        data = np.empty(size, dtype=np.uint8)
+        split = batch_size * shard_size
+        if paths:
+            decode_shards(paths, data[:split].reshape(batch_size, shard_size), config, device)
+        if tail_size:
+            with tail.open("rb") as part:
+                data[split:] = read_uniform(make_decoder(part), tail_size)
+        if hashlib.sha256(data).hexdigest() != header["sha256"]:
+            raise ValueError("Decoded bytes failed SHA-256 verification")
+        restored = temp / "restored"
+        with restored.open("wb") as output:
+            data.tofile(output)
+        os.replace(restored, destination)
+    return size
+
+
+def validate_config(config):
+    if set(config) != set(MODEL_DEFAULTS):
+        raise ValueError("Invalid SEP+TRACE model settings")
+    if config["vocab_size"] != 256 or config["vocab_dim"] != 64 or config["hidden_dim"] != 256:
+        raise ValueError("SEP+TRACE uses vocab_size=256, vocab_dim=64 and hidden_dim=256")
+    if config["seq_len"] < 4 or config["batch_size"] < 1:
+        raise ValueError("seq_len must be at least 4 and batch_size must be positive")
+    if config["n_heads"] < 1 or 256 % config["n_heads"]:
+        raise ValueError("n_heads must divide 256")
+    if config["n_layers"] < 1 or config["ffn_dim"] < 1:
+        raise ValueError("n_layers and ffn_dim must be positive")
+    if config["compute_type"] not in {"iter", "ps", "parallel_ps"}:
+        raise ValueError("compute_type must be iter, ps or parallel_ps")
+    feature_type = config["feature_type"]
+    base, _, factor = feature_type.partition("_")
+    if feature_type not in {"relu", "elu+1", "sqr", "abs", "favor+"} and not (
+        base == "favor+" and factor.isdecimal() and int(factor) > 0
+    ):
+        raise ValueError("Invalid attention feature_type")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Compress or decompress a binary file with SEP+TRACE")
+    parser.add_argument("--mode", choices=("compress", "decompress"), default="compress")
+    parser.add_argument("--input_dir", type=Path, default=Path("../data/book1"), help="Input file")
+    parser.add_argument("--output", type=Path, help="Destination file")
+    parser.add_argument("--prefix", default="_book1", help="Prefix for the default archive filename")
+    parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
+    parser.add_argument("--gpu_id", default="0")
+    parser.add_argument("--print_step", type=int, default=1000, help="Progress interval, 0 disables")
+    for name, default in MODEL_DEFAULTS.items():
+        parser.add_argument(f"--{name}", type=type(default), default=default)
+    args = parser.parse_args()
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    if args.device == "auto":
+        args.device = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.device == "cuda" and not torch.cuda.is_available():
+        parser.error("No CUDA device available. Use --device=cpu.")
+    device = torch.device(args.device)
+    config = {name: getattr(args, name) for name in MODEL_DEFAULTS}
+    if args.mode == "compress":
+        dest = args.output or Path(
+            f"{args.prefix}_{args.vocab_dim}_{args.hidden_dim}_{args.ffn_dim}_"
+            f"bs{args.batch_size}_{args.n_layers}_seq{args.seq_len}.compressed.combined"
+        )
+    else:
+        dest = args.output or Path(str(args.input_dir) + ".restored")
+    if args.input_dir.resolve() == dest.resolve():
+        parser.error("Input and output must be different files")
+    start = time.perf_counter()
+    try:
+        if args.mode == "compress":
+            validate_config(config)
+            size = compress(args.input_dir, dest, config, device, args.print_step)
+            print(f"Compressed {size} bytes to {dest.stat().st_size} bytes in {time.perf_counter() - start:.3f}s")
+        else:
+            size = decompress(args.input_dir, dest, device)
+            print(f"Decompressed {size} bytes in {time.perf_counter() - start:.3f}s (SHA-256 verified)")
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError) as error:
+        parser.exit(1, f"SEP+TRACE: {error}\n")
+
+
+if __name__ == "__main__":
+    main()

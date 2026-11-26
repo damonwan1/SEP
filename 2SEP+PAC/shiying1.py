@@ -7,21 +7,15 @@ import time
 import random
 import math
 
-inputs_list=None
-streamPooling=None
-streamcount = 0
-
-
 class MaskModel(nn.Module):
-    def __init__(self, input_shape=(512,33, 256), threshold=0.5, patch=16, device=torch.device('cuda:0')):
+    def __init__(self, input_shape=(512,33, 256), threshold=0.5, patch=16, device=None):
         super().__init__()
         self.mask = nn.Parameter(torch.empty((1, input_shape[1], 1), device=device))
         torch.nn.init.xavier_normal_(self.mask)
-        #self.mask = nn.Parameter(torch.ones((1, input_shape[1], 1), device=device))
-        self.init_mask = torch.ones((1, input_shape[1], 1), device=device)
-        self.indices_to_keep = (torch.arange(input_shape[1], device=device) % 8 == 0).unsqueeze(-1).float()
-        self.threshold = torch.tensor(threshold, device=device)
-        self.last_z_dim = None  # 用于保存z的第二维度的大小
+        indices = (torch.arange(input_shape[1], device=device) % 8 == 0).unsqueeze(-1).float()
+        self.register_buffer("indices_to_keep", indices)
+        self.register_buffer("threshold", torch.tensor(threshold, device=device))
+
     def forward(self, x):
 
         mask = torch.sigmoid(self.mask).to(x.device)
@@ -35,7 +29,7 @@ class MaskModel(nn.Module):
 class mlpCompressor(torch.nn.Module):
 
   def __init__(self, vocab_size, vocab_dim,  hidden_dim, n_layers, ffn_dim, n_heads,
-               batch_size):
+               batch_size, seq_len=48, device=None):
     super(mlpCompressor, self).__init__()
 
     self._vocab_size = vocab_size
@@ -65,11 +59,11 @@ class mlpCompressor(torch.nn.Module):
     
     self.layers = torch.nn.ModuleList(l)
     self.last = []
-    # 512，17，256
-    self.U_map = torch.nn.Linear(33, 1, bias=True)
+    patch_count = seq_len - 16 + 1
+    self.U_map = torch.nn.Linear(patch_count, 1, bias=True)
     torch.nn.init.normal_(self.U_map.weight, 0, 0.01)
     torch.nn.init.normal_(self.U_map.bias, 0, 0.01)
-    self.mask =MaskModel()
+    self.mask = MaskModel((batch_size, patch_count, hidden_dim), device=device)
   
   def init_token_order(self, x, module, scale):
     bs, seqlen, vlen = x.shape
@@ -82,7 +76,7 @@ class mlpCompressor(torch.nn.Module):
 
     return x
 
-  def forward(self, x, inputs_list=None):
+  def forward(self, x):
     """Naive full forward pass."""
     #print("rrrrrrrrrr")
     x = torch.sigmoid(self.input_map(x))
@@ -135,33 +129,13 @@ class mlpCompressor(torch.nn.Module):
     x = self.output_logit_map(x)
     return x
 
-  def full_loss(self,
-                inputs,
-                with_grad=True,inputs_lista=None,streamPoolingb=None,
-                nonpad_mask=None,
-                return_acc=False):
-    """Naive full loss and grad."""
-    # if inputs_list is not None:
-    #   for i in range(1,4):
-    #     with torch.cuda.stream(streamPooling[i]):
-    #       inputs_list[i] = inputs_list[i].to("cuda",non_blocking=True).long()
-    global inputs_list
-    inputs_list=inputs_lista
-    global streamPooling
-    streamPooling=streamPoolingb
-    global streamcount 
-    streamcount= 0
-
-    logits = self.forward(inputs[:, :-1])
-    logits = logits.transpose(1, 2)
-    loss = torch.nn.functional.cross_entropy(
-            logits[:, :, -1], inputs[:, -1], reduction='mean')
-  
+  def full_loss(self, inputs, with_grad=True):
+    logits = self.forward(inputs[:, :-1]).transpose(1, 2)
+    loss = F.cross_entropy(logits[:, :, -1], inputs[:, -1])
     if with_grad:
       loss.backward()
-
     return loss, logits
-    
+
 
 class dense_baens(nn.Module):
   def __init__(self, N=5, B=4, D1=3, D2=2):
@@ -200,20 +174,7 @@ class BELayer(torch.nn.Module):
     if self.ln1:
       x = self.layernorm1(x)
     skip = x
-    #print("zzzzzzzzzzz")
-    # global streamcount
-    # global inputs_list
-    # global streamPooling
-    #print("stream:"+str(streamcount))
     x = self.V_map(x)
-    # if streamcount == 0:
-    #   #print("inputlista:")
-    #   #print(inputs_list)
-    #   streamcount=streamcount+1
-    #   if inputs_list is not None:
-    #     for i in range(1,4):
-    #       with torch.cuda.stream(streamPooling[i]):
-    #         inputs_list[i] = inputs_list[i].to("cuda",non_blocking=True).long()
     x = self.layernorm2(x)
     x = torch.nn.functional.gelu(x)
     x = (skip + x)/2
@@ -240,19 +201,6 @@ class LinearLayer(torch.nn.Module):
     self.ln1 = 1
 
   def full_forward(self, x):
-    #print("vvvvvv")
-    # global streamcount
-    # global inputs_list
-    # global streamPooling
-    # #print("stream:"+str(streamcount))
-    # if streamcount == 0:
-    #   #print("inputlistb:")
-    #   #print(input_list)
-    #   streamcount=streamcount+1
-    #   if inputs_list is not None:
-    #     for i in range(1,4):
-    #       with torch.cuda.stream(streamPooling[i]):
-    #         inputs_list[i] = inputs_list[i].to("cuda",non_blocking=True).long()
     x = self._ffn(x)
 
     return x
@@ -263,19 +211,6 @@ class LinearLayer(torch.nn.Module):
       x = self.layernorm1(x)
          
     skip = x
-    
-    global streamcount
-    global inputs_list
-    global streamPooling
-    #print("stream:"+str(streamcount))
-    if streamcount == 0:
-      #print("inputlistb:")
-      #print(input_list)
-      streamcount=streamcount+1
-      if inputs_list is not None:
-        for i in range(1,4):
-          with torch.cuda.stream(streamPooling[i]):
-            inputs_list[i] = inputs_list[i].to("cuda",non_blocking=True).long()
     
     x = self.U_map(x)
 

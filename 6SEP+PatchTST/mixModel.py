@@ -9,21 +9,18 @@ import torch.nn.functional as F
 import numpy as np
 import torch.nn as nn
 
-stream_num = 4
-
 # from collections import OrderedDict
 
 # Cell
 class MaskModel(nn.Module):
-    def __init__(self, batch_size,patch_num,  patch_len,threshold=0.5, device=torch.device('cuda:0')):
+    def __init__(self, batch_size,patch_num,  patch_len,threshold=0.5, device=None):
         super().__init__()
-        self.mask = nn.Parameter(torch.empty((512,patch_num, 256), device=device))
+        self.mask = nn.Parameter(torch.empty((batch_size, patch_num, 256), device=device))
         torch.nn.init.xavier_normal_(self.mask)
-        #self.mask = nn.Parameter(torch.ones((1, input_shape[1], 1), device=device))
-        self.init_mask = torch.ones((1,patch_num, 1), device=device)
-        self.indices_to_keep = (torch.arange(patch_num, device=device) % patch_len == 0).unsqueeze(-1).float()
-        self.threshold = torch.tensor(threshold, device=device)
-    
+        indices = (torch.arange(patch_num, device=device) % patch_len == 0).unsqueeze(-1).float()
+        self.register_buffer("indices_to_keep", indices)
+        self.register_buffer("threshold", torch.tensor(threshold, device=device))
+
     def forward(self, x):
 
         mask = torch.sigmoid(self.mask).to(x.device)
@@ -52,6 +49,7 @@ class PatchTST_backbone(nn.Module):
                  key_padding_mask: bool = 'auto',
                  store_attn=True,
                  res_attention=True,
+                 device=None,
                  **kwargs):
         super().__init__()
 
@@ -60,7 +58,7 @@ class PatchTST_backbone(nn.Module):
         self.stride = stride
         self.vocab_dim = vocab_dim
 
-        patch_num = int((seq_len - patch_len) / stride + 1)
+        patch_num = (seq_len - patch_len) // stride + 1
 
         self.input_map = torch.nn.Embedding(256, self.vocab_dim)
         # Backbone
@@ -74,12 +72,12 @@ class PatchTST_backbone(nn.Module):
         self.U_map = torch.nn.Linear(patch_num,8, bias=True)
         torch.nn.init.kaiming_normal_(self.U_map.weight, nonlinearity='relu')
         torch.nn.init.constant_(self.U_map.bias, 0)
-        self.mask =MaskModel(batch_size,patch_num,patch_len)
+        self.mask = MaskModel(batch_size, patch_num, patch_len, device=device)
         self.output_logit_map = torch.nn.Linear(256, 256)
         self.X_map = torch.nn.Linear(8, 128, bias=True)
         self.Z_map = torch.nn.Linear(128,1, bias=True)
 
-    def forward(self, x,inputs_list=None,streamPooling=None,):  # z: [bs x nvars x seq_len]
+    def forward(self, x):
         x = self.input_map(x)
         #x = self._concat_pos_embs(x, 0)
         x = torch.sigmoid(x)
@@ -94,11 +92,6 @@ class PatchTST_backbone(nn.Module):
         x = x.permute(0, 2, 1)
         
         x = self.U_map(x)
-        if inputs_list is not None:
-            global stream_num
-            for i in range(1,stream_num):
-                with torch.cuda.stream(streamPooling[i]):
-                    inputs_list[i] = inputs_list[i].to("cuda",non_blocking=True).long()
         x = x.permute(0, 2, 1)
         x = torch.nn.functional.gelu(x)
         skip = x 
@@ -114,18 +107,11 @@ class PatchTST_backbone(nn.Module):
 
         return x
 
-    def full_loss(self,
-                  inputs,inputs_list=None,streamPooling=None,
-                  with_grad=True):
-
-        logits = self.forward(inputs[:, :-1],inputs_list=inputs_list,streamPooling=streamPooling)
-        logits = logits.transpose(1, 2)
-        loss = torch.nn.functional.cross_entropy(
-            logits[:, :, -1], inputs[:, -1], reduction='mean')
-
+    def full_loss(self, inputs, with_grad=True):
+        logits = self.forward(inputs[:, :-1]).transpose(1, 2)
+        loss = F.cross_entropy(logits[:, :, -1], inputs[:, -1])
         if with_grad:
             loss.backward()
-
         return loss, logits
 
     def _concat_pos_embs(self, x, start_index):
